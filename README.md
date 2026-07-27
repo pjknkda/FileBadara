@@ -330,8 +330,16 @@ failure.
 ### Releases
 
 Pushing a `v*` tag builds statically linked binaries for linux and darwin on
-amd64 and arm64, and attaches them to a GitHub release with a `SHA256SUMS` file.
-`make dist VERSION=v1.2.3` produces the same archives locally.
+amd64 and arm64 and attaches them to a GitHub release, unpacked, alongside a
+`SHA256SUMS` file. `make dist VERSION=v1.2.3` produces the same set locally.
+
+Downloading one is a curl and a chmod, since a release asset does not carry the
+executable bit:
+
+```bash
+curl -fsSLO https://github.com/pjknkda/FileBadara/releases/latest/download/filebadara_v1.2.3_linux_amd64
+chmod +x filebadara_v1.2.3_linux_amd64
+```
 
 The tag is stamped into the binary:
 

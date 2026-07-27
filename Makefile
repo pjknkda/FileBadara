@@ -60,19 +60,19 @@ vet:
 fmt:
 	gofmt -w ./cmd ./internal
 
-# Cross-compiled archives plus checksums, ready to attach to a release.
-# Statically linked so the binary does not depend on the builder's libc.
+# Cross-compiled binaries plus checksums, ready to attach to a release.
+# Uploaded as plain binaries rather than archives, so a download is one curl
+# away. Statically linked, so they do not depend on the builder's libc.
 dist:
 	rm -rf $(DIST)
 	mkdir -p $(DIST)
 	@for platform in $(PLATFORMS); do \
 		os=$${platform%/*}; arch=$${platform#*/}; \
 		echo "building $$os/$$arch"; \
-		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(BUILD) -o $(DIST)/$(BINARY) ./cmd/filebadara || exit 1; \
-		tar czf $(DIST)/$(BINARY)_$(VERSION)_$${os}_$${arch}.tar.gz -C $(DIST) $(BINARY) -C .. LICENSE README.md || exit 1; \
-		rm $(DIST)/$(BINARY); \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(BUILD) \
+			-o $(DIST)/$(BINARY)_$(VERSION)_$${os}_$${arch} ./cmd/filebadara || exit 1; \
 	done
-	cd $(DIST) && sha256sum *.tar.gz > SHA256SUMS
+	cd $(DIST) && sha256sum $(BINARY)_* > SHA256SUMS
 	@cat $(DIST)/SHA256SUMS
 
 clean:
