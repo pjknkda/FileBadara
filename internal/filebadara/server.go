@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -75,6 +77,10 @@ type Server struct {
 	domain   string
 	password string
 	ttl      time.Duration
+
+	// Logger receives one line per download. Set it before serving; nil uses
+	// the standard logger.
+	Logger *log.Logger
 
 	mu        sync.RWMutex
 	transfers map[string]*transfer
@@ -202,6 +208,9 @@ func (s *Server) handleNew(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}()
 
+	s.logf("share token=%s file=%q size=%d client=%s ttl=%s",
+		shortToken(token), filename, size, clientHost(r), s.ttl)
+
 	base := s.baseURL(r)
 	downloadURL := base + "/" + token + "/" + url.PathEscape(filename)
 	waitURL := base + "/wait/" + token + "/" + secret
@@ -228,13 +237,23 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// This long-poll is the sender's connection to the server: it stays open
+	// until there is something to send, so it doubles as a liveness signal.
+	token := shortToken(parts[1])
+	client := clientHost(r)
+	s.logf("sender token=%s client=%s status=waiting", token, client)
+
 	select {
 	case j := <-t.jobs:
 		// The trailing offset tells the sender where to start reading.
 		fmt.Fprintf(w, "%s/upload/%s/%s/%s %d\n", s.baseURL(r), parts[1], t.secret, j.id, j.start)
+		s.logf("sender token=%s client=%s job=%s offset=%d status=dispatched",
+			token, client, shortToken(j.id), j.start)
 	case <-t.expired:
 		http.Error(w, "expired", http.StatusGone)
+		s.logf("sender token=%s client=%s status=expired", token, client)
 	case <-r.Context().Done():
+		s.logf("sender token=%s client=%s status=disconnected", token, client)
 	}
 }
 
@@ -250,6 +269,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	started := time.Now()
 	token := parts[0]
 	t := s.getTransfer(token)
 	if t == nil {
@@ -270,6 +290,13 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if !partial {
 		chosen = &byteRange{start: 0, length: t.size}
 	}
+
+	served := "full"
+	if partial {
+		served = fmt.Sprintf("%d-%d", chosen.start, chosen.start+chosen.length-1)
+	}
+	s.logf("download token=%s file=%q client=%s agent=%q range=%s status=start",
+		shortToken(token), t.filename, clientHost(r), userAgent(r), served)
 
 	j := newJob(chosen.start)
 
@@ -300,6 +327,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	case <-time.After(senderWaitTimeout):
 		http.Error(w, "sender unavailable", http.StatusGatewayTimeout)
+		s.logf("download file=%q client=%s token=%s status=%q",
+			t.filename, clientHost(r), shortToken(token), "sender unavailable")
 		return
 	}
 	defer body.Close()
@@ -317,7 +346,54 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// The sender streams from chosen.start to the end of the file, so anything
 	// past the requested slice is cut off here.
-	_, _ = io.CopyN(w, body, chosen.length)
+	sent, err := io.CopyN(w, body, chosen.length)
+
+	status := "ok"
+	if err != nil {
+		status = err.Error()
+	}
+	s.logf("download token=%s file=%q client=%s range=%s sent=%d/%d took=%s status=%q",
+		shortToken(token), t.filename, clientHost(r), served,
+		sent, chosen.length, time.Since(started).Round(time.Millisecond), status)
+}
+
+func (s *Server) logf(format string, args ...any) {
+	logger := s.Logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	logger.Printf(format, args...)
+}
+
+// shortToken keeps enough of a token to tie log lines about one sharing URL
+// together. Logging the whole thing would let anyone reading the log download
+// the file for as long as the URL lives.
+func shortToken(token string) string {
+	const keep = 8
+	if len(token) <= keep {
+		return token
+	}
+	return token[:keep]
+}
+
+// userAgent trims the header to something a log line can hold. The caller must
+// print it with %q: it is attacker-controlled, and a newline in it would
+// otherwise let a downloader forge log entries.
+func userAgent(r *http.Request) string {
+	const limit = 120
+	agent := r.UserAgent()
+	if len(agent) > limit {
+		return agent[:limit] + "..."
+	}
+	return agent
+}
+
+func clientHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -338,25 +414,38 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	token := shortToken(parts[1])
+	client := clientHost(r)
+	job := shortToken(parts[3])
+
 	t.mu.Lock()
 	j := t.pending[parts[3]]
 	t.mu.Unlock()
 	if j == nil {
 		http.Error(w, "download request is gone", http.StatusGone)
+		s.logf("upload token=%s client=%s job=%s status=gone", token, client, job)
 		return
 	}
 
 	if !j.attach(r.Body) {
 		http.Error(w, "upload already attached", http.StatusConflict)
+		s.logf("upload token=%s client=%s job=%s status=duplicate", token, client, job)
 		return
 	}
 
+	started := time.Now()
+	s.logf("upload token=%s client=%s job=%s offset=%d status=start", token, client, job, j.start)
+
+	status := "done"
 	select {
 	case <-j.done:
 		w.WriteHeader(http.StatusOK)
 	case <-r.Context().Done():
 		j.finish()
+		status = "disconnected"
 	}
+	s.logf("upload token=%s client=%s job=%s took=%s status=%s",
+		token, client, job, time.Since(started).Round(time.Millisecond), status)
 }
 
 func (s *Server) authorized(r *http.Request) bool {
