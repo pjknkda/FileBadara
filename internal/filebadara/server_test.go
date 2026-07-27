@@ -791,7 +791,7 @@ func TestDownloadLogging(t *testing.T) {
 	payload := bytes.Repeat([]byte("FileBadara!"), 1024)
 	app := New("", "", time.Minute)
 
-	var logged bytes.Buffer
+	var logged logBuffer
 	app.Logger = log.New(&logged, "", 0)
 
 	server := newServerForTest(t, app)
@@ -810,7 +810,9 @@ func TestDownloadLogging(t *testing.T) {
 	io.Copy(io.Discard, response.Body)
 	response.Body.Close()
 
-	out := logged.String()
+	// The handler logs after the last byte is written, so the client can finish
+	// reading before the line exists. Wait for it instead of racing it.
+	out := logged.waitFor(t, "sent=1000/1000")
 	for _, want := range []string{
 		`file="report.pdf"`,
 		"client=127.0.0.1",
@@ -865,4 +867,37 @@ func TestUserAgentIsSafeToLog(t *testing.T) {
 	if got := userAgent(request); len(got) > 130 {
 		t.Fatalf("a 500 byte agent was logged as %d bytes", len(got))
 	}
+}
+
+// logBuffer collects log lines written from the server's own goroutines while
+// the test reads them. bytes.Buffer alone is not safe for that, and log.Logger
+// only serialises writers against each other, not against a reader.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitFor returns the log once marker appears in it.
+func (b *logBuffer) waitFor(t *testing.T, marker string) string {
+	t.Helper()
+	for range 500 {
+		if out := b.String(); strings.Contains(out, marker) {
+			return out
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("log never contained %q:\n%s", marker, b.String())
+	return ""
 }
