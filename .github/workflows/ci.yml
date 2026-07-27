@@ -19,3 +19,26 @@ jobs:
       - run: make test-race
       - run: make vet
       - run: make build
+
+      # test-race above already ran this, but it would have skipped silently if
+      # sh or curl were missing. Re-run it strictly so that cannot happen. Only
+      # the shell helper: this runner has no curl.exe for the PowerShell one.
+      - run: make test-shell-helper
+        env:
+          FILEBADARA_REQUIRE_HELPERS: "1"
+
+  # The PowerShell sender helper is only meaningful where PowerShell and
+  # curl.exe are the real thing, so it gets a Windows runner of its own.
+  powershell-helper:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Called directly rather than through make: GNU make is not part of the
+      # Windows runner image. -race is skipped too, since it needs a C compiler.
+      - run: go test -v -run TestPowerShellHelperEndToEnd ./internal/...
+        env:
+          FILEBADARA_REQUIRE_HELPERS: "1"
