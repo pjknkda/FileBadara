@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -98,8 +97,20 @@ func startHelper(t *testing.T, cmd *exec.Cmd) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stderr := &syncBuffer{}
+
+	// A real file rather than an io.Writer. exec copies an io.Writer's stderr in
+	// a goroutine, and Wait blocks until every process holding the write end has
+	// closed it. The helper's curl grandchildren inherit that handle, so killing
+	// the helper is not enough: on Windows this made cleanup sit out the whole
+	// transfer lifetime.
+	stderr, err := os.CreateTemp("", "filebadara-helper-stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cmd.Stderr = stderr
+
+	// Backstop in case a grandchild holds some other handle open.
+	cmd.WaitDelay = 5 * time.Second
 
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -107,13 +118,16 @@ func startHelper(t *testing.T, cmd *exec.Cmd) string {
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		if out := stderr.String(); out != "" {
+		_ = stderr.Close()
+		if out, err := os.ReadFile(stderr.Name()); err == nil && len(out) > 0 {
 			t.Logf("helper stderr:\n%s", out)
 		}
+		// An orphaned grandchild may still hold it open on Windows.
+		_ = os.Remove(stderr.Name())
 	})
 
 	// stderr is only read from the cleanup, which runs after Wait and so sees
-	// everything the copier collected.
+	// everything the helper wrote.
 	printed := make(chan string, 1)
 	go func() {
 		defer close(printed)
@@ -205,23 +219,4 @@ func requireCommands(t *testing.T, names ...string) {
 			t.Skipf("%s is not installed", name)
 		}
 	}
-}
-
-// syncBuffer collects a child process's stderr, which the exec package writes
-// from its own goroutine while the test reads it.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }
