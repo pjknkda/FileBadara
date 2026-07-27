@@ -1,0 +1,21 @@
+[Unit]
+Description=FileBadara temporary file relay
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/filebadara \
+  -domain drop.example.com \
+  -cert-cache /var/lib/filebadara/certs \
+  -password-file /etc/filebadara/password
+User=filebadara
+Restart=on-failure
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=filebadara
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,44 @@
+# Build output
+/filebadara
+/bin/
+/dist/
+*.exe
+*.exe~
+*.so
+*.dylib
+*.dll
+
+# Test & coverage
+*.test
+*.out
+coverage.html
+
+# Profiling
+*.prof
+*.pprof
+
+# Go workspace (local-only, per-developer)
+go.work
+go.work.sum
+
+# Runtime state
+/.filebadara-certs/
+
+# Secrets & TLS material
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Editors & tooling
+.claude/
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+._*
+Thumbs.db
