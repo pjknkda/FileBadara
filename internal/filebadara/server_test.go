@@ -183,7 +183,7 @@ func TestHSTSOnlyInHTTPSMode(t *testing.T) {
 		domain string
 		want   string
 	}{
-		{"https mode", "drop.example.com", "max-age=31536000"},
+		{"https mode", "badara.example.com", "max-age=31536000"},
 		{"plain http mode", "", ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -531,3 +531,242 @@ func createTransfer(t *testing.T, base, filename string, size int, password stri
 type statusError struct{ code int }
 
 func (e *statusError) Error() string { return http.StatusText(e.code) }
+
+// TestRoutesRejectWrongMethods checks that every route answers 405 rather than
+// acting on a request it was not designed for.
+//
+// Scenario: each route is called with a method it does not accept.
+// Expect: 405 from all of them.
+func TestRoutesRejectWrongMethods(t *testing.T) {
+	server := newServerForTest(t, New("", "", time.Minute))
+
+	for _, test := range []struct{ method, path string }{
+		{http.MethodPost, "/"},
+		{http.MethodPost, "/sh"},
+		{http.MethodPost, "/ps"},
+		{http.MethodGet, "/new"},
+		{http.MethodPost, "/wait/token/secret"},
+		{http.MethodGet, "/upload/token/secret/job"},
+		{http.MethodPost, "/token/file.bin"},
+		{http.MethodDelete, "/"},
+		{http.MethodPut, "/sh"},
+	} {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			status, _ := do(t, test.method, server.URL+test.path, nil)
+			if status != http.StatusMethodNotAllowed {
+				t.Fatalf("got %d, want 405", status)
+			}
+		})
+	}
+}
+
+// TestNewRejectsInvalidRequests checks the validation on /new, which is the only
+// endpoint that takes caller-supplied values.
+//
+// Scenario: a sharing URL is requested with a missing or malformed name or size.
+// Expect: 400 every time, and no transfer created.
+func TestNewRejectsInvalidRequests(t *testing.T) {
+	server := newServerForTest(t, New("", "", time.Minute))
+
+	for _, test := range []struct {
+		name string
+		form url.Values
+	}{
+		{"no name", url.Values{"size": {"10"}}},
+		{"empty name", url.Values{"name": {"  "}, "size": {"10"}}},
+		{"name is a dot", url.Values{"name": {"."}, "size": {"10"}}},
+		{"name is a slash", url.Values{"name": {"/"}, "size": {"10"}}},
+		{"no size", url.Values{"name": {"file.bin"}}},
+		{"size is not a number", url.Values{"name": {"file.bin"}, "size": {"abc"}}},
+		{"size is negative", url.Values{"name": {"file.bin"}, "size": {"-1"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status, body := do(t, http.MethodPost, server.URL+"/new", test.form)
+			if status != http.StatusBadRequest {
+				t.Fatalf("got %d (%s), want 400", status, strings.TrimSpace(string(body)))
+			}
+		})
+	}
+}
+
+// TestPrivateRoutesHideUnknownTokens checks that /wait and /upload give nothing
+// away, since the token and secret are the only thing protecting a transfer.
+//
+// Scenario: both routes are called with a wrong shape, an unknown token, and a
+// valid token paired with a wrong secret.
+// Expect: 404 in every case, never a hint that the token exists.
+func TestPrivateRoutesHideUnknownTokens(t *testing.T) {
+	server := newServerForTest(t, New("", "", time.Minute))
+	_, waitURL := createTransfer(t, server.URL, "file.bin", 11, "")
+
+	// .../wait/{token}/{secret}
+	fields := strings.Split(strings.TrimPrefix(waitURL, server.URL+"/"), "/")
+	if len(fields) != 3 {
+		t.Fatalf("unexpected wait URL %q", waitURL)
+	}
+	token, secret := fields[1], fields[2]
+
+	for _, test := range []struct{ name, method, path string }{
+		{"wait with too few parts", http.MethodGet, "/wait/" + token},
+		{"wait with an unknown token", http.MethodGet, "/wait/nope/" + secret},
+		{"wait with a wrong secret", http.MethodGet, "/wait/" + token + "/nope"},
+		{"upload with too few parts", http.MethodPut, "/upload/" + token + "/" + secret},
+		{"upload with an unknown token", http.MethodPut, "/upload/nope/" + secret + "/job"},
+		{"upload with a wrong secret", http.MethodPut, "/upload/" + token + "/nope/job"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status, _ := do(t, test.method, server.URL+test.path, nil)
+			if status != http.StatusNotFound {
+				t.Fatalf("got %d, want 404", status)
+			}
+		})
+	}
+}
+
+// TestUploadRejectsAJobThatIsGone checks the case where the sender wins a race
+// against a downloader who has already given up.
+//
+// Scenario: a valid token and secret are used with a job id that was never
+// handed out.
+// Expect: 410, distinguishing "you are too late" from "wrong credentials".
+func TestUploadRejectsAJobThatIsGone(t *testing.T) {
+	server := newServerForTest(t, New("", "", time.Minute))
+	_, waitURL := createTransfer(t, server.URL, "file.bin", 11, "")
+
+	fields := strings.Split(strings.TrimPrefix(waitURL, server.URL+"/"), "/")
+	uploadURL := server.URL + "/upload/" + fields[1] + "/" + fields[2] + "/never-issued"
+
+	status, _ := do(t, http.MethodPut, uploadURL, nil)
+	if status != http.StatusGone {
+		t.Fatalf("got %d, want 410", status)
+	}
+}
+
+// TestUploadRejectsASecondAttachment checks that one download can only ever be
+// fed by one upload, which is what keeps two downloaders from sharing a stream.
+//
+// Scenario: a download is started so a job exists, one upload attaches to it and
+// stays open, then a second upload targets the same job.
+// Expect: 409 for the second one.
+func TestUploadRejectsASecondAttachment(t *testing.T) {
+	payload := bytes.Repeat([]byte("FileBadara!"), 1024)
+	server := newServerForTest(t, New("", "", time.Minute))
+	downloadURL, waitURL := createTransfer(t, server.URL, "file.bin", len(payload), "")
+
+	// Held open until the assertion is done so the download, its upload, and
+	// therefore the job all stay alive.
+	stop := make(chan struct{})
+	defer close(stop)
+
+	// One byte of body proves the first upload attached and the server started
+	// relaying it. Waiting on the response headers alone would not: net/http
+	// buffers them until enough body has been written.
+	relaying := make(chan struct{})
+	go func() {
+		response, err := http.Get(downloadURL)
+		if err != nil {
+			return
+		}
+		defer response.Body.Close()
+		if _, err := io.ReadFull(response.Body, make([]byte, 1)); err != nil {
+			return
+		}
+		close(relaying)
+		<-stop
+	}()
+
+	uploadURL, _ := parseJob(t, get(t, waitURL))
+
+	// A pipe fed part of the file and never closed keeps the first upload
+	// attached without completing it.
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	go func() {
+		request, err := http.NewRequest(http.MethodPut, uploadURL, reader)
+		if err != nil {
+			return
+		}
+		if response, err := http.DefaultClient.Do(request); err == nil {
+			response.Body.Close()
+		}
+	}()
+	go func() { _, _ = writer.Write(payload[:8192]) }()
+
+	select {
+	case <-relaying:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first upload never attached")
+	}
+
+	status, _ := do(t, http.MethodPut, uploadURL, nil)
+	if status != http.StatusConflict {
+		t.Fatalf("got %d, want 409", status)
+	}
+}
+
+// newServerForTest starts a test server whose cleanup drops live connections
+// before closing. A parked long-poll on /wait would otherwise keep Close
+// waiting for the whole transfer lifetime.
+func newServerForTest(t *testing.T, app *Server) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(app)
+	t.Cleanup(func() {
+		server.CloseClientConnections()
+		server.Close()
+	})
+	return server
+}
+
+// do sends one request and returns its status and body. A non-nil form is sent
+// as a URL-encoded POST body.
+func do(t *testing.T, method, url string, form url.Values) (int, []byte) {
+	t.Helper()
+
+	var body io.Reader
+	if form != nil {
+		body = strings.NewReader(form.Encode())
+	}
+	request, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if form != nil {
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	got, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response.StatusCode, got
+}
+
+// TestJobAcceptsOnlyOneUpload checks the same one-upload-per-download invariant
+// at the level that enforces it, without the HTTP round trip.
+//
+// Scenario: two uploads are attached to a single job.
+// Expect: the first is taken and the second refused.
+func TestJobAcceptsOnlyOneUpload(t *testing.T) {
+	j := newJob(0)
+
+	if !j.attach(io.NopCloser(strings.NewReader("first"))) {
+		t.Fatal("the first upload was refused")
+	}
+	if j.attach(io.NopCloser(strings.NewReader("second"))) {
+		t.Fatal("the second upload was accepted")
+	}
+
+	body := <-j.upload
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "first" {
+		t.Fatalf("the job holds %q, want the first upload", got)
+	}
+}

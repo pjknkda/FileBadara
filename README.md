@@ -1,19 +1,64 @@
 # FileBadara
 
-> 파일 받아라. 서버에는 남기지 않는다.
+> 파일 받아라.
 
-FileBadara is a temporary, storage-free file relay. The sender keeps a helper command running, and every downloader causes that helper to upload the local file through a new independent stream.
+*Badara* (받아라) is Korean for "take it", so the name reads as "take the file" —
+and the tagline adds that nothing is left behind on the server.
 
-The server never writes file contents to disk and never broadcasts one stream to multiple downloaders.
+**Send someone a download link for a file on your machine, without uploading it
+anywhere first.**
+
+Run one command next to the file and it prints a URL. Send that URL to anyone.
+When they open it, the bytes stream from your machine through the FileBadara
+server to them — the server relays the transfer and never keeps a copy.
+
+```console
+$ curl -fsSL https://badara.example.com/sh | sh -s -- ./archive.tar.zst
+https://badara.example.com/Uqaaf7f_gxSPjXYUPqdE5HhM/archive.tar.zst
+```
+
+Leave that command running for as long as the link should work.
+
+`badara.example.com` above is a FileBadara server you run yourself — there is no
+hosted service. It is a single static binary with no database and no storage.
+
+**Why bother**
+
+- The file never sits on someone else's disk, so nothing outlives the transfer.
+- No account and no upload wait — the link works the moment you run the command.
+- The server needs no storage at all, so a $5 VPS can relay files of any size.
+
+## What each side needs
+
+Nobody installs a FileBadara client. The sender helper is a short script the
+server prints on request, and the downloader just fetches a URL.
+
+| Role | Needs |
+| --- | --- |
+| Downloader | Any HTTP client — `curl`, `wget`, or a browser. |
+| Sender on Unix | A POSIX shell and `curl`. The helper also calls `wc` for the file size. |
+| Sender on Windows | PowerShell and `curl.exe`, which ships with Windows 10 1803 and later. |
+| Server operator | The `filebadara` binary. No runtime, database, or disk space. |
+
+Nothing is fetched from a package registry, and you can read the helper before
+running it with `curl https://badara.example.com/sh`.
 
 ## How it works
+
+Three parties: you (the sender), the FileBadara server, and whoever you sent the
+link to. Your command holds a connection open to the server, waiting to be told
+that someone wants the file. Each time that happens, it uploads the file again on
+a fresh connection, and the server pipes those bytes straight to that one
+downloader.
 
 ```text
 Downloader A ── GET ──> FileBadara <── PUT A ── sender curl A
 Downloader B ── GET ──> FileBadara <── PUT B ── sender curl B
 ```
 
-Each downloader gets a separate upload from the sender, so a slow downloader never slows down another one.
+So two people downloading at once get two separate uploads from you, and a slow
+downloader never slows down anyone else. Nothing is ever written to disk on the
+server, and no single stream is shared between downloaders.
 
 ## Quick start
 
@@ -101,7 +146,7 @@ Use `-addr` for an unprivileged port instead:
 Point the domain's A or AAAA record at the server, allow inbound TCP ports 80 and 443, then:
 
 ```bash
-./filebadara -domain drop.example.com
+./filebadara -domain badara.example.com
 ```
 
 FileBadara obtains and renews the TLS certificate automatically through ACME. Port 80 serves the ACME challenge and redirects to HTTPS. Certificates are cached in `.filebadara-certs` unless `-cert-cache` says otherwise — set it to a persistent directory in production.
@@ -117,7 +162,7 @@ $ ./filebadara -password-file /etc/filebadara/password
 
 ```bash
 ./filebadara \
-  -domain drop.example.com \
+  -domain badara.example.com \
   -password-file /etc/filebadara/password
 ```
 
@@ -244,6 +289,43 @@ Other targets: `make test`, `make test-race`, `make vet`, `make fmt`, `make clea
 
 `make test-race` is separate from `make test` because `-race` needs cgo and a C
 compiler, which a plain Go install does not have.
+
+`TESTFLAGS` is passed to every test target, so a per-test breakdown is:
+
+```console
+$ make test TESTFLAGS=-v
+--- PASS: TestRangeDownload (0.01s)
+    --- PASS: TestRangeDownload/middle (0.00s)
+    --- PASS: TestRangeDownload/open_ended (0.00s)
+    --- PASS: TestRangeDownload/suffix (0.00s)
+...
+```
+
+Use it to narrow down too: `make test TESTFLAGS="-v -run TestRange"`.
+
+`make cover` reports coverage per function, and `make cover-html` writes
+`coverage.html` with the uncovered lines highlighted.
+
+```console
+$ make cover
+ok  github.com/pjknkda/filebadara/internal/filebadara  coverage: 78.3% of statements
+server.go:389:  parseByteRange      100.0%
+server.go:241:  handleDownload       79.6%
+...
+```
+
+### Testing the helper scripts
+
+The `/sh` and `/ps` helpers are string constants, so a shell or PowerShell
+mistake in them is invisible to ordinary Go tests. `make test-helpers` fetches
+each script from a running server and executes it against a real file, then
+checks a whole download, a repeat download, and a resumed one.
+
+Each helper needs its interpreter, and skips when it is missing. CI asserts both
+rather than allowing a silent skip: the Linux job runs the shell helper, and a
+Windows job runs the PowerShell one, where `pwsh` and `curl.exe` are genuine.
+Setting `FILEBADARA_REQUIRE_HELPERS=1` turns a missing interpreter into a
+failure.
 
 ### Releases
 

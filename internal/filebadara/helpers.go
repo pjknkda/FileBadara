@@ -47,7 +47,7 @@ if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
 fi
 
 file=$1
-name=$(basename "$file")
+name=${file##*/}
 size=$(wc -c < "$file")
 
 # Neither URL can contain whitespace, so the shell can split the response.

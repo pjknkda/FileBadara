@@ -16,6 +16,41 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: make test-race
+      # One run does all three jobs: -v names every test in the log, -race keeps
+      # the check the suite had before, and the profile feeds the report below.
+      - name: Test with the race detector and coverage
+        run: make cover TESTFLAGS="-race -v"
+
+      # The full per-function table is already in the step above; this puts the
+      # one number that matters where it can be read without opening the log.
+      - name: Report the coverage total
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')
+          echo "Coverage: $total"
+          echo "Coverage: **$total**" >> "$GITHUB_STEP_SUMMARY"
+
       - run: make vet
       - run: make build
+
+      # The run above already covered this, but it would have skipped silently
+      # if sh or curl were missing. Re-run it strictly so that cannot happen.
+      # Only the shell helper: this runner has no curl.exe for the other one.
+      - run: make test-shell-helper TESTFLAGS=-v
+        env:
+          FILEBADARA_REQUIRE_HELPERS: "1"
+
+  # The PowerShell sender helper is only meaningful where PowerShell and
+  # curl.exe are the real thing, so it gets a Windows runner of its own.
+  powershell-helper:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Called directly rather than through make: GNU make is not part of the
+      # Windows runner image. -race is skipped too, since it needs a C compiler.
+      - run: go test -v -run TestPowerShellHelperEndToEnd ./internal/...
+        env:
+          FILEBADARA_REQUIRE_HELPERS: "1"

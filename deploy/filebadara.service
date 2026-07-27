@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/filebadara \
-  -domain drop.example.com \
+  -domain badara.example.com \
   -cert-cache /var/lib/filebadara/certs \
   -password-file /etc/filebadara/password
 User=filebadara
