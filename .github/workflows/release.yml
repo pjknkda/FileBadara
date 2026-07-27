@@ -39,4 +39,4 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             $prerelease \
-            dist/*.tar.gz dist/SHA256SUMS
+            dist/*
