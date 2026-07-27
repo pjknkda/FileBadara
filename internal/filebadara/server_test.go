@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -768,5 +770,99 @@ func TestJobAcceptsOnlyOneUpload(t *testing.T) {
 	}
 	if string(got) != "first" {
 		t.Fatalf("the job holds %q, want the first upload", got)
+	}
+}
+
+// TestMain silences the server's own logging. TestDownloadLogging installs its
+// own logger to inspect it; everywhere else it is noise between test results.
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	os.Exit(m.Run())
+}
+
+// TestDownloadLogging checks the log line an operator relies on, and that it
+// cannot be used to steal the transfer it describes.
+//
+// Scenario: a ranged download runs against a server with a captured logger.
+// Expect: the line names the file, client, range and byte count, and contains
+// neither the full token nor the secret, either of which would let a log reader
+// fetch the file or impersonate the sender.
+func TestDownloadLogging(t *testing.T) {
+	payload := bytes.Repeat([]byte("FileBadara!"), 1024)
+	app := New("", "", time.Minute)
+
+	var logged bytes.Buffer
+	app.Logger = log.New(&logged, "", 0)
+
+	server := newServerForTest(t, app)
+	downloadURL, waitURL := createTransfer(t, server.URL, "report.pdf", len(payload), "")
+	go servePayload(t, waitURL, payload, nil)
+
+	request, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Range", "bytes=1000-1999")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+
+	out := logged.String()
+	for _, want := range []string{
+		`file="report.pdf"`,
+		"client=127.0.0.1",
+		"range=1000-1999",
+		"sent=1000/1000",
+		`status="ok"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log is missing %s:\n%s", want, out)
+		}
+	}
+
+	// .../{token}/{filename} and .../wait/{token}/{secret}
+	fields := strings.Split(strings.TrimPrefix(waitURL, server.URL+"/"), "/")
+	token, secret := fields[1], fields[2]
+	if strings.Contains(out, token) {
+		t.Errorf("the full token reached the log, which would let a reader download the file:\n%s", out)
+	}
+	if strings.Contains(out, secret) {
+		t.Errorf("the sender's secret reached the log:\n%s", out)
+	}
+	if !strings.Contains(out, "token="+token[:8]) {
+		t.Errorf("no short token to correlate lines by:\n%s", out)
+	}
+}
+
+// TestUserAgentIsSafeToLog checks the treatment of the one logged field a
+// downloader controls. Go's own client and server both reject a newline in a
+// header, so this guards the layer that would matter if one ever got through.
+//
+// Scenario: userAgent is given a header carrying a newline and a forged line,
+// and separately one that is far too long.
+// Expect: %q collapses it to a single escaped token, and long values are cut.
+func TestUserAgentIsSafeToLog(t *testing.T) {
+	request, err := http.NewRequest(http.MethodGet, "http://example.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assigning the map directly: NewRequest's setter rejects this outright.
+	request.Header["User-Agent"] = []string{"evil\nshare token=AAAAAAAA file=\"forged\""}
+
+	line := fmt.Sprintf("download agent=%q", userAgent(request))
+	if strings.Count(line, "\n") != 0 {
+		t.Fatalf("the agent broke the line in two: %s", line)
+	}
+	if !strings.Contains(line, `\n`) {
+		t.Fatalf("the newline was not escaped: %s", line)
+	}
+
+	request.Header["User-Agent"] = []string{strings.Repeat("x", 500)}
+	if got := userAgent(request); len(got) > 130 {
+		t.Fatalf("a 500 byte agent was logged as %d bytes", len(got))
 	}
 }

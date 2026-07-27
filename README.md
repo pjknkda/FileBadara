@@ -36,7 +36,7 @@ server prints on request, and the downloader just fetches a URL.
 | Role | Needs |
 | --- | --- |
 | Downloader | Any HTTP client — `curl`, `wget`, or a browser. |
-| Sender on Unix | A POSIX shell and `curl`. The helper also calls `wc` for the file size. |
+| Sender on Unix | A POSIX shell and `curl`. The helper also calls `wc` for the file size and `date` to timestamp its log. |
 | Sender on Windows | PowerShell and `curl.exe`, which ships with Windows 10 1803 and later. |
 | Server operator | The `filebadara` binary. No runtime, database, or disk space. |
 
@@ -230,6 +230,42 @@ sudo systemctl enable --now filebadara
 - The sender helper must keep running; closing it ends the transfer.
 - Restarting the server invalidates all sharing URLs and active transfers.
 
+## Logs
+
+Both ends narrate a transfer, and the same 8-character token prefix appears on
+every line so the two records line up. The server writes to its standard log,
+the sender to stderr, which keeps the download URL alone on its stdout.
+
+```console
+# server
+share    token=zE9X0Uap file="report.pdf" size=200000 client=10.0.0.9 ttl=10m0s
+sender   token=zE9X0Uap client=10.0.0.9 status=waiting
+download token=zE9X0Uap file="report.pdf" client=203.0.113.7 agent="curl/8.5.0" range=160000-199999 status=start
+sender   token=zE9X0Uap client=10.0.0.9 job=E7zRMVL0 offset=160000 status=dispatched
+upload   token=zE9X0Uap client=10.0.0.9 job=E7zRMVL0 offset=160000 status=start
+download token=zE9X0Uap file="report.pdf" client=203.0.113.7 range=160000-199999 sent=40000/40000 took=7ms status="ok"
+upload   token=zE9X0Uap client=10.0.0.9 job=E7zRMVL0 took=41ms status=done
+
+# sender
+2026-07-27T11:38:08Z upload token=zE9X0Uap file="report.pdf" offset=160000 status=start
+2026-07-27T11:38:08Z upload token=zE9X0Uap file="report.pdf" offset=160000 status=done
+```
+
+Only the first 8 characters of the token are ever logged. The whole token is the
+download URL, so a log that carried it would let anyone reading the log fetch the
+file for as long as the URL lives. The sender's secret is never logged at all.
+
+This is the one thing FileBadara does leave behind. File contents are still never
+written to disk, but the log records which file was shared, which addresses asked
+for it, and when. If that is more than you want on the machine, send the log to
+`/dev/null` in the unit file.
+
+On Windows the sender needs PowerShell 7 for the line that reports an upload
+finishing: `Start-ThreadJob` runs in the same process, where a job can still
+write to the console. Under Windows PowerShell 5.1 the helper falls back to
+`Start-Job` and only the `status=start` lines appear, with the server's record
+still showing how each transfer ended.
+
 ### Range requests
 
 The server answers a single `Range` request with `206 Partial Content`, and reports
@@ -274,6 +310,7 @@ The `/wait` and `/upload` routes are private implementation details protected by
 - Do not hand-write `curl -u upload http://...` against an HTTPS deployment. `curl` sends Basic credentials on the first request, so the password would reach port 80 in the clear before the redirect to HTTPS. Use the `/sh` or `/ps` helpers, which always use the `https://` base URL.
 - Keep the password file readable only by the FileBadara service account.
 - Anyone holding a download URL can download the file while the URL is active.
+- The log records file names and client addresses. It never records a whole token or the sender's secret, so it cannot be used to reach a transfer, but it is a record of who fetched what. See [Logs](#logs).
 - `curl | sh` and dynamic PowerShell execution run code returned by the server. Use only a server you trust, or inspect `/sh` or `/ps` before executing it.
 
 ## Build
