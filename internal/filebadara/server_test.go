@@ -62,7 +62,7 @@ func TestTwoConcurrentDownloadsUseIndependentUploads(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		uploadURL, offset := parseJob(t, jobBytes)
+		uploadURL, offset, _ := parseJob(t, jobBytes)
 		if offset != 0 {
 			t.Fatalf("got offset %d, want 0 for a whole-file download", offset)
 		}
@@ -451,19 +451,68 @@ func TestRangeNotSatisfiable(t *testing.T) {
 	}
 }
 
-// parseJob splits a /wait response into the upload URL and the offset the
-// sender is expected to start from.
-func parseJob(t *testing.T, body []byte) (string, int64) {
+// TestSenderLearnsDownloaderAddress checks that the sender is told who each
+// upload is for. The sender never talks to the downloader, so the job line is
+// the only place that address can reach it.
+//
+// Scenario: a download is started and the sender picks up the job for it.
+// Expect: the job names the downloader, and the transfer still completes.
+func TestSenderLearnsDownloaderAddress(t *testing.T) {
+	payload := bytes.Repeat([]byte("FileBadara!"), 64)
+	server := newServerForTest(t, New("", "", time.Minute))
+	downloadURL, waitURL := createTransfer(t, server.URL, "file.bin", len(payload), "")
+
+	downloaded := make(chan []byte, 1)
+	go func() {
+		response, err := http.Get(downloadURL)
+		if err != nil {
+			downloaded <- nil
+			return
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		downloaded <- body
+	}()
+
+	uploadURL, offset, client := parseJob(t, get(t, waitURL))
+	if client != "127.0.0.1" {
+		t.Fatalf("the job names %q as the downloader, want 127.0.0.1", client)
+	}
+
+	request, err := http.NewRequest(http.MethodPut, uploadURL, bytes.NewReader(payload[offset:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ContentLength = int64(len(payload)) - offset
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	select {
+	case body := <-downloaded:
+		if !bytes.Equal(body, payload) {
+			t.Fatal("the download differs from the uploaded file")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("download timed out")
+	}
+}
+
+// parseJob splits a /wait response into the upload URL, the offset the sender
+// is expected to start from, and the downloader the bytes are for.
+func parseJob(t *testing.T, body []byte) (string, int64, string) {
 	t.Helper()
 	fields := strings.Fields(string(body))
-	if len(fields) != 2 {
+	if len(fields) != 3 {
 		t.Fatalf("unexpected job response: %q", body)
 	}
 	offset, err := strconv.ParseInt(fields[1], 10, 64)
 	if err != nil {
 		t.Fatalf("bad offset in %q: %v", body, err)
 	}
-	return fields[0], offset
+	return fields[0], offset, fields[2]
 }
 
 // servePayload plays the role of the sender helper for exactly one download.
@@ -480,7 +529,7 @@ func servePayload(t *testing.T, waitURL string, payload []byte, uploaded chan<- 
 	if err != nil {
 		return
 	}
-	uploadURL, offset := parseJob(t, body)
+	uploadURL, offset, _ := parseJob(t, body)
 
 	slice := payload[offset:]
 	if uploaded != nil {
@@ -677,7 +726,7 @@ func TestUploadRejectsASecondAttachment(t *testing.T) {
 		<-stop
 	}()
 
-	uploadURL, _ := parseJob(t, get(t, waitURL))
+	uploadURL, _, _ := parseJob(t, get(t, waitURL))
 
 	// A pipe fed part of the file and never closed keeps the first upload
 	// attached without completing it.
@@ -754,7 +803,7 @@ func do(t *testing.T, method, url string, form url.Values) (int, []byte) {
 // Scenario: two uploads are attached to a single job.
 // Expect: the first is taken and the second refused.
 func TestJobAcceptsOnlyOneUpload(t *testing.T) {
-	j := newJob(0)
+	j := newJob(0, "127.0.0.1")
 
 	if !j.attach(io.NopCloser(strings.NewReader("first"))) {
 		t.Fatal("the first upload was refused")

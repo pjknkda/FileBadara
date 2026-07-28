@@ -66,17 +66,19 @@ printf '%%s\n' "$download_url"
 token=${download_url%%/*}
 token=$(printf '%%.8s' "${token##*/}")
 
+# The server answers with "URL OFFSET DOWNLOADER", none of which can contain
+# whitespace, so the shell can split the line.
 while job=$(curl -fsS "$wait_url" 2>/dev/null); do
     [ -n "$job" ] || continue
     set -- $job
-    log "upload token=$token file=\"$name\" offset=$2 status=start"
+    log "upload token=$token file=\"$name\" offset=$2 client=$3 status=start"
     # -C makes curl seek to the offset the server asked for, so a resumed
     # download never re-uploads the part the downloader already has.
     (
         if curl -fsS -C "$2" --upload-file "$file" "$1"; then
-            log "upload token=$token file=\"$name\" offset=$2 status=done"
+            log "upload token=$token file=\"$name\" offset=$2 client=$3 status=done"
         else
-            log "upload token=$token file=\"$name\" offset=$2 status=failed"
+            log "upload token=$token file=\"$name\" offset=$2 client=$3 status=failed"
         fi
     ) &
 done
@@ -111,36 +113,46 @@ function Write-Log($message) {
     [Console]::Error.WriteLine("$now $message")
 }
 
-# Start-ThreadJob runs in this process, so an upload can report its own result
-# as it happens. Start-Job would put it in a child whose console output is lost,
-# leaving only the server's record of how the transfer ended.
-$starter = "Start-Job"
-if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) { $starter = "Start-ThreadJob" }
+# One upload, run on a background thread of this same process so that it can
+# report its own result to the console the moment it finishes. Start-Job would
+# run it in a child process whose console output goes nowhere, which is why this
+# does not use jobs at all: Start-ThreadJob only ships with PowerShell 7, and on
+# Windows PowerShell the fallback silently swallowed every completion line.
+$uploader = {
+    param($Path, $Url, $Offset, $Token, $Name, $Client)
+    # -C seeks to the offset the server asked for, so a resumed download
+    # never re-uploads the part the downloader already has.
+    & curl.exe -fsS -C $Offset --upload-file $Path $Url
+    $status = "done"
+    if ($LASTEXITCODE -ne 0) { $status = "failed" }
+    $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    [Console]::Error.WriteLine("$now upload token=$Token file=""$Name"" offset=$Offset client=$Client status=$status")
+}
 
-$jobs = @()
+# The server answers with "URL OFFSET DOWNLOADER".
+$uploads = @()
 while ($true) {
     $job = & curl.exe -fsS $waitUrl 2>$null
     if ($LASTEXITCODE -ne 0) { break }
     if ([string]::IsNullOrWhiteSpace($job)) { continue }
 
     $fields = $job.Trim() -split "\s+"
-    Write-Log "upload token=$token file=""$($item.Name)"" offset=$($fields[1]) status=start"
+    Write-Log "upload token=$token file=""$($item.Name)"" offset=$($fields[1]) client=$($fields[2]) status=start"
 
-    $jobs += & $starter -ScriptBlock {
-        param($Path, $Url, $Offset, $Token, $Name)
-        # -C seeks to the offset the server asked for, so a resumed download
-        # never re-uploads the part the downloader already has.
-        & curl.exe -fsS -C $Offset --upload-file $Path $Url
-        $status = "done"
-        if ($LASTEXITCODE -ne 0) { $status = "failed" }
-        $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        [Console]::Error.WriteLine("$now upload token=$Token file=""$Name"" offset=$Offset status=$status")
-    } -ArgumentList $full, $fields[0], $fields[1], $token, $item.Name
+    $shell = [PowerShell]::Create()
+    [void]$shell.AddScript($uploader.ToString())
+    [void]$shell.AddArgument($full)
+    [void]$shell.AddArgument($fields[0])
+    [void]$shell.AddArgument($fields[1])
+    [void]$shell.AddArgument($token)
+    [void]$shell.AddArgument($item.Name)
+    [void]$shell.AddArgument($fields[2])
+    $uploads += @{ Shell = $shell; Handle = $shell.BeginInvoke() }
 }
 
-if ($jobs.Count -gt 0) {
-    $jobs | Wait-Job | Receive-Job
-    $jobs | Remove-Job
+foreach ($upload in $uploads) {
+    [void]$upload.Shell.EndInvoke($upload.Handle)
+    $upload.Shell.Dispose()
 }
 `
 

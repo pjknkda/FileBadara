@@ -32,6 +32,9 @@ const (
 type job struct {
 	id    string
 	start int64
+	// client is the downloader's address, passed on to the sender so both ends
+	// of a transfer can log who it was for.
+	client string
 
 	attached sync.Once
 	finished sync.Once
@@ -39,10 +42,11 @@ type job struct {
 	done     chan struct{}
 }
 
-func newJob(start int64) *job {
+func newJob(start int64, client string) *job {
 	return &job{
 		id:     randomToken(18),
 		start:  start,
+		client: client,
 		upload: make(chan io.ReadCloser, 1),
 		done:   make(chan struct{}),
 	}
@@ -245,10 +249,12 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case j := <-t.jobs:
-		// The trailing offset tells the sender where to start reading.
-		fmt.Fprintf(w, "%s/upload/%s/%s/%s %d\n", s.baseURL(r), parts[1], t.secret, j.id, j.start)
-		s.logf("sender token=%s client=%s job=%s offset=%d status=dispatched",
-			token, client, shortToken(j.id), j.start)
+		// The offset tells the sender where to start reading, and the address
+		// after it is the downloader the bytes are for. Both are whitespace-free
+		// so the helper scripts can split the line.
+		fmt.Fprintf(w, "%s/upload/%s/%s/%s %d %s\n", s.baseURL(r), parts[1], t.secret, j.id, j.start, j.client)
+		s.logf("sender token=%s client=%s job=%s offset=%d downloader=%s status=dispatched",
+			token, client, shortToken(j.id), j.start, j.client)
 	case <-t.expired:
 		http.Error(w, "expired", http.StatusGone)
 		s.logf("sender token=%s client=%s status=expired", token, client)
@@ -298,7 +304,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	s.logf("download token=%s file=%q client=%s agent=%q range=%s status=start",
 		shortToken(token), t.filename, clientHost(r), userAgent(r), served)
 
-	j := newJob(chosen.start)
+	j := newJob(chosen.start, clientHost(r))
 
 	t.mu.Lock()
 	t.pending[j.id] = j
@@ -388,10 +394,15 @@ func userAgent(r *http.Request) string {
 	return agent
 }
 
+// clientHost never returns an empty string: the /wait response puts it in a
+// whitespace-separated field, so a missing address has to still be one token.
 func clientHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if strings.TrimSpace(host) == "" {
+		return "unknown"
 	}
 	return host
 }
