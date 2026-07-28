@@ -241,15 +241,19 @@ the sender to stderr, which keeps the download URL alone on its stdout.
 share    token=zE9X0Uap file="report.pdf" size=200000 client=10.0.0.9 ttl=10m0s
 sender   token=zE9X0Uap client=10.0.0.9 status=waiting
 download token=zE9X0Uap file="report.pdf" client=203.0.113.7 agent="curl/8.5.0" range=160000-199999 status=start
-sender   token=zE9X0Uap client=10.0.0.9 job=E7zRMVL0 offset=160000 status=dispatched
+sender   token=zE9X0Uap client=10.0.0.9 job=E7zRMVL0 offset=160000 downloader=203.0.113.7 status=dispatched
 upload   token=zE9X0Uap client=10.0.0.9 job=E7zRMVL0 offset=160000 status=start
 download token=zE9X0Uap file="report.pdf" client=203.0.113.7 range=160000-199999 sent=40000/40000 took=7ms status="ok"
 upload   token=zE9X0Uap client=10.0.0.9 job=E7zRMVL0 took=41ms status=done
 
 # sender
-2026-07-27T11:38:08Z upload token=zE9X0Uap file="report.pdf" offset=160000 status=start
-2026-07-27T11:38:08Z upload token=zE9X0Uap file="report.pdf" offset=160000 status=done
+2026-07-27T11:38:08Z upload token=zE9X0Uap file="report.pdf" offset=160000 client=203.0.113.7 status=start
+2026-07-27T11:38:08Z upload token=zE9X0Uap file="report.pdf" offset=160000 client=203.0.113.7 status=done
 ```
+
+The `client=` on a sender line is the downloader's address, which the server hands
+to the sender along with the offset. It is the only thing about the far end the
+sender can know: it never talks to the downloader directly.
 
 Only the first 8 characters of the token are ever logged. The whole token is the
 download URL, so a log that carried it would let anyone reading the log fetch the
@@ -260,11 +264,10 @@ written to disk, but the log records which file was shared, which addresses aske
 for it, and when. If that is more than you want on the machine, send the log to
 `/dev/null` in the unit file.
 
-On Windows the sender needs PowerShell 7 for the line that reports an upload
-finishing: `Start-ThreadJob` runs in the same process, where a job can still
-write to the console. Under Windows PowerShell 5.1 the helper falls back to
-`Start-Job` and only the `status=start` lines appear, with the server's record
-still showing how each transfer ended.
+The PowerShell helper runs each upload on a background thread of its own process
+rather than as a PowerShell job, so both lines appear on Windows PowerShell 5.1
+and PowerShell 7 alike. A job would run the upload in a child process whose
+console output is discarded, leaving only `status=start`.
 
 ### Range requests
 
